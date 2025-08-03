@@ -1,0 +1,11 @@
+false
+zip rar
+c cpp
+100
+5
+/mnt/e/L3-T2/CSE314/OFFLINE1/test-cases/3/input/submissions
+2005001 2005010
+/mnt/e/L3-T2/CSE314/OFFLINE1/test-cases/3/input/submissions/expected_output.txt
+10
+/mnt/e/L3-T2/CSE314/OFFLINE1/test-cases/3/input/plagiarism.txt
+100

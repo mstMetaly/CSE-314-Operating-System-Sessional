@@ -1,0 +1,12 @@
+true
+zip rar
+c cpp py
+100
+5
+/mnt/e/L3-T2/CSE314/OFFLINE1/2005110
+2005001 2005010
+/mnt/e/L3-T2/CSE314/OFFLINE1/2005110/Output/output.txt
+10
+/mnt/e/L3-T2/CSE314/OFFLINE1/2005110/plagiarism.txt
+100
+

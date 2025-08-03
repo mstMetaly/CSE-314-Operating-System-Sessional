@@ -1,0 +1,896 @@
+diff --git a/Makefile b/Makefile
+index 62fd0f8..c4dae69 100644
+--- a/Makefile
++++ b/Makefile
+@@ -139,6 +139,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_load\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index d1b6bb9..963624e 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -106,6 +106,14 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            get_trace(int);
++void            count_process(int*, int*);
++void            count_memory(int*, int*);
++void            get_lock_init(void);
++void            get_acquire(void);
++void            get_release(void);
++int             get_last_cmd(void);
++int             set_last_cmd(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -174,6 +182,7 @@ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+ 
++
+ // plic.c
+ void            plicinit(void);
+ void            plicinithart(void);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..2b7b936 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -6,6 +6,9 @@
+ #include "proc.h"
+ #include "defs.h"
+ 
++struct userSpinLock kernel_userSpinLock;
++struct command_info commandObj;
++
+ struct cpu cpus[NCPU];
+ 
+ struct proc proc[NPROC];
+@@ -686,3 +689,151 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++
++//trace
++void
++get_trace(int n){
++  struct proc *p = myproc();
++  p->trace_id = n;
++}
++
++//count process
++void count_process(int* activeProcess, int* totalPossible)
++{
++  struct proc* p;
++  *(totalPossible) = NPROC;
++
++  int activeCount = 0;
++  for(p = proc; p < &proc[NPROC]; p++)
++  {
++    if(p->state == RUNNABLE || p->state == RUNNING)
++      activeCount++;
++  }
++
++  *(activeProcess) = activeCount;
++
++}
++
++
++//count memory and total memory
++void count_memory(int* memSize, int* totalMemSize)
++{
++  struct proc* p;
++
++  unsigned long mem_size = 0;
++
++  for(p = proc; p < &proc[NPROC]; p++)
++  {
++    if(p->state == RUNNABLE || p->state == RUNNING || p->state == SLEEPING)
++      mem_size += (unsigned long)p->sz;
++  }
++
++  unsigned long kernbase = KERNBASE;
++  unsigned long phystop = PHYSTOP;
++
++  unsigned long result = (long long)phystop - (long long)kernbase;
++
++  *(memSize) = (int)(mem_size/(1024));
++  *(totalMemSize) = (int)((result < 0 ? -result : result) / (1024 * 1024));
++  
++}
++
++
++//initilization of lock
++void
++get_lock_init()
++{
++  kernel_userSpinLock.locked = 0;
++}
++
++
++void
++get_acquire()
++{
++  while(__sync_lock_test_and_set(&kernel_userSpinLock.locked, 1) != 0)
++    ;
++  __sync_synchronize();
++
++}
++
++
++void
++get_release()
++{
++  __sync_synchronize();
++  __sync_lock_release(&kernel_userSpinLock.locked);
++};
++
++
++
++//func for get and set the last cmd --task 3
++//get the previous command
++int
++get_last_cmd()
++{
++  //sending total arg
++  int arg_count = commandObj.arg_size;
++  uint64 total_arg;
++  argaddr(2,&total_arg);
++  copyout(myproc()->pagetable , total_arg, (char*)&arg_count, sizeof(int));
++
++  //sending last command
++  char *buf;
++  argaddr(0, (uint64*)&buf);
++  copyout(myproc()->pagetable, (uint64)buf, commandObj.last_command, sizeof(commandObj.last_command));
++
++
++  //need to send args
++  char (*user_args)[128]; 
++  argaddr(1, (uint64*)&user_args); 
++  for (int i = 0; i < total_arg && i < 10; i++)
++  {
++    // Calculate the address of the i-th user argument
++    uint64 user_arg_addr = (uint64)user_args[i];
++    // Copy each argument from kernel space to user space
++    if (copyout(myproc()->pagetable, user_arg_addr, commandObj.last_command_args[i], sizeof(commandObj.last_command_args[i])) < 0) {
++        return -1; // Handle copy error
++    }
++  }
++
++  return 0;
++}
++
++
++//set the previous command
++int 
++set_last_cmd()
++{
++  char cmd[128]; 
++  int arg_count;
++
++  //for last command name
++  if(argstr(0, (char* )&cmd, sizeof(cmd)) < 0)
++    return -1;
++  strncpy(commandObj.last_command, cmd, sizeof(commandObj.last_command) - 1);
++  commandObj.last_command[sizeof(commandObj.last_command) - 1] = '\0';
++
++  //for total arg
++  argaddr(2, (uint64*)&arg_count);
++  int total_arg;
++  copyin(myproc()->pagetable , (char*)&total_arg, arg_count, sizeof(int));
++  commandObj.arg_size = total_arg;
++
++  //for setting the arguments in the stored commandObj
++  char (*user_args)[128]; // Pointer to an array of 128-char strings
++  argaddr(1, (uint64*)&user_args); 
++  for (int i = 0; i < total_arg && i < 10; i++) {
++    if (copyin(myproc()->pagetable, (char*)&commandObj.last_command_args[i], 
++        (uint64)(user_args[i]), sizeof(commandObj.last_command_args[i])) < 0) {
++          return -1; // Handle copy error
++    }
++    commandObj.last_command_args[i][sizeof(commandObj.last_command_args[i]) - 1] = '\0'; // Ensure null termination
++  }
++
++  return 0;
++  
++}
++
++
++
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..e22c876 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,27 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int trace_id;                //trace the system call
+ };
++
++//procInfo
++struct procInfo{
++    int activeProcess;
++    int totalProcess;
++    int memSize;
++    int totalMemSize;
++};
++
++//new lock for user 
++struct userSpinLock{
++    volatile int locked;
++};
++
++//new strutc for command info 
++struct command_info{
++  char last_command[128];
++  char last_command_args[10][128];
++  int arg_size;
++};
++
++
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..6246c1e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -57,6 +57,7 @@ void
+ argint(int n, int *ip)
+ {
+   *ip = argraw(n);
++  // *ip = myproc()->trapframe->a0 + n;
+ }
+ 
+ // Retrieve an argument as a pointer.
+@@ -101,6 +102,13 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_info(void);
++extern uint64 sys_uinitlock(void);
++extern uint64 sys_uacquire(void);
++extern uint64 sys_urelease(void);
++extern uint64 sys_setLastCmd(void);
++extern uint64 sys_getLastCmd(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +134,13 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_info]    sys_info,
++[SYS_uinitlock] sys_uinitlock,
++[SYS_uacquire] sys_uacquire,
++[SYS_urelease] sys_urelease,
++[SYS_setCommand] sys_setLastCmd,
++[SYS_getCommand] sys_getLastCmd,
+ };
+ 
+ void
+@@ -135,10 +150,267 @@ syscall(void)
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
++  //before system call 
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+-    p->trapframe->a0 = syscalls[num]();
++    if(num == 23)
++    {
++      p->trapframe->a0 = syscalls[num]();
++    }
++    else{
++        //here can check now which system call happended;
++        //need to print arguments and for name should keep an array
++
++        if(p->trace_id == num)
++        {
++          switch (num){
++            case 1:
++              printf("pid:  %d, syscall:  fork, ", p->pid);
++              printf("args: () ,");
++              break;
++
++
++            case 2:
++              printf("pid:  %d, syscall:  exit, ", p->pid);
++
++              int exit_arg1;
++              argint(0, &exit_arg1);
++              printf("args: (%d) ,", exit_arg1);
++              break;
++
++
++            case 3:
++              printf("pid:  %d, syscall:  wait, ", p->pid);
++
++              uint64 wait_arg1;
++              int wait_val;
++
++              argaddr(0, &wait_arg1);
++
++              copyin(p->pagetable, (char* )&wait_val, wait_arg1, sizeof(int));
++              printf("args: (%d) ,", (int)wait_val);
++              break;
++
++
++            case 4:
++              printf("pid:  %d, syscall:  pipe, ", p->pid);
++              
++              uint64 pipe_arg1;
++              int pipe_val;
++
++              argaddr(0, &pipe_arg1);
++              copyin(p->pagetable, (char* )&pipe_val, pipe_arg1, sizeof(int));
++              printf("args: (%d) ,", pipe_val);
++              break;
++
++
++            case 5:
++              printf("pid:  %d, syscall:  read, ", p->pid);
++              int r_arg1;
++              uint64 r_arg2;
++              int r_arg3;
++
++              argint(0, &r_arg1);
++              argaddr(1, &r_arg2);
++              argint(2, &r_arg3);
++
++              printf("args: (%d, %p, %d ), ", (int)r_arg1, (void* )r_arg2, r_arg3);
++              break;
++
++
++            case 6:
++              printf("pid:  %d, syscall:  kill, ", p->pid);
++
++              int kill_arg1;
++              argint(0, &kill_arg1);
++              printf("args: (%d) ,", kill_arg1);
++              break;
++
++
++            case 7:
++              printf("pid:  %d, syscall:  exec, ", p->pid);
++              
++              uint64 exec_arg1;
++              argaddr(0, &exec_arg1);
++
++              char exec_filename[MAXPATH];
++              copyin(p->pagetable, (char* )&exec_filename, exec_arg1, sizeof(exec_filename));
++              exec_filename[MAXPATH - 1] = '\0';
++
++              printf("args: (%s) ,", exec_filename);
++              break;
++
++
++            case 8:
++              printf("pid:  %d, syscall:  fstat, ", p->pid);
++              //need to print arg
++              break;
++
++
++            case 9:
++              printf("pid:  %d, syscall:  chdir, return: %lu\n", p->pid, p->trapframe->a0);
++
++              uint64 chdir_arg1;
++              argaddr(0, &chdir_arg1);
++
++              char chdir_filename[MAXPATH];
++              copyin(p->pagetable, (char* )&chdir_filename, chdir_arg1, sizeof(chdir_filename));
++              chdir_filename[MAXPATH - 1] = '\0';
++
++              printf("args: (%s) ,", chdir_filename);
++              break;
++
++
++            case 10:
++              printf("pid:  %d, syscall:  dup, ",p->pid);
++
++              int dup_arg1;
++              argint(0, &dup_arg1);
++              printf("args: (%d) ,", dup_arg1);
++              break;
++
++
++            case 11:
++              printf("pid:  %d, syscall:  getpid, ",p->pid);
++              printf("args: () ,");
++              break;
++
++
++            case 12:
++              printf("pid:  %d, syscall:  sbrk, ",p->pid);
++
++              int sbrk_arg1;
++              argint(0, &sbrk_arg1);
++              printf("args: (%d) ,", sbrk_arg1);
++              break;
++
++
++            case 13:
++              printf("pid:  %d, syscall:  sleep, ", p->pid);
++
++              int sleep_arg1;
++              argint(0, &sleep_arg1);
++              printf("args: (%d) ,", sleep_arg1);
++              break;
++
++
++            case 14:
++              printf("pid:  %d, syscall:  uptime, ", p->pid);
++              printf("args: () ,");
++              break;
++
++
++            case 15:
++              printf("pid:  %d, syscall:  open, ", p->pid);
++              uint64 open_arg1;
++              int open_arg2;
++              argaddr(0, &open_arg1);
++              argint(1, &open_arg2);
++
++              char open_filename[MAXPATH];
++              copyin(p->pagetable, (char* )&open_filename, open_arg1, sizeof(open_filename));
++              open_filename[MAXPATH - 1] = '\0';
++
++              printf("args: (%s, %d ) ,", open_filename, open_arg2);
++              break;
++
++
++            case 16:
++              printf("pid:  %d, syscall:  write, ", p->pid);
++
++              int write_arg1;
++              uint64 write_arg2;
++              int write_arg3;
++
++              argint(0, &write_arg1);
++              argaddr(1, &write_arg2);
++              argint(2, &write_arg3);
++
++              printf("args: (%d, %p, %d ), ", (int)write_arg1, (void* )write_arg2, write_arg3);
++              break;
++
++
++            case 17:
++              printf("pid:  %d, syscall:  mknod, ", p->pid);
++              //need to print arg
++              break;
++
++
++            case 18:
++              printf("pid:  %d, syscall:  unlink, ", p->pid);
++
++              uint64 unlink_arg1;
++              argaddr(0, &unlink_arg1);
++
++              char unlink_filename[MAXPATH];
++              copyin(p->pagetable, (char* )&unlink_filename, unlink_arg1, sizeof(unlink_filename));
++              unlink_filename[MAXPATH - 1] = '\0';
++
++              printf("args: (%s) ,", unlink_filename);
++              break;
++
++
++            case 19:
++              printf("pid:  %d, syscall:  link, ", p->pid);
++
++              uint64 link_arg1;
++              uint64 link_arg2;
++
++              argaddr(0, &link_arg1);
++              argaddr(0, &link_arg2);
++
++              char link_filename1[MAXPATH];
++              char link_filename2[MAXPATH];
++
++              copyin(p->pagetable, (char* )&link_filename1, link_arg1, sizeof(link_filename1));
++              link_filename1[MAXPATH - 1] = '\0';
++
++              copyin(p->pagetable, (char* )&link_filename2, link_arg2, sizeof(link_filename2));
++              link_filename2[MAXPATH - 1] = '\0';
++
++              printf("args: (%s, %s) ,", link_filename1 , link_filename2);
++              break;
++
++
++            case 20:
++              printf("pid:  %d, syscall:  mkdir, ", p->pid);
++
++              uint64 mkdir_arg1;
++              argaddr(0, &mkdir_arg1);
++
++              char mkdir_filename[MAXPATH];
++              copyin(p->pagetable, (char* )&mkdir_filename, mkdir_arg1, sizeof(mkdir_filename));
++              mkdir_filename[MAXPATH - 1] = '\0';
++
++              printf("args: (%s) ,", mkdir_filename);
++              break;
++
++
++            case 21:
++              printf("pid:  %d, syscall:  close, ", p->pid);
++
++              int close_arg1;
++              argint(0, &close_arg1);
++              printf("args: (%d) ,", close_arg1);
++              break;
++
++            default:
++              break;
++          }
++
++        }
++
++        //calling the syscall
++        p->trapframe->a0 = syscalls[num]();
++
++        if(p->trace_id == num)
++        {
++          printf("return : %lu\n", p->trapframe->a0);
++        }
++       
++    }
++  
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..6432f15 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,10 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  23
++#define SYS_info   24
++#define SYS_uinitlock 25
++#define SYS_uacquire 26
++#define SYS_urelease 27
++#define SYS_setCommand 28
++#define SYS_getCommand 29
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..26d7eb6 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
+ uint64
+ sys_exit(void)
+ {
+@@ -91,3 +92,84 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++//trace 
++uint64
++sys_trace(void)
++{
++  int n;
++  argint(0,&n);
++
++  get_trace(n);
++  return 200;
++}
++
++
++//info proc
++uint64 
++sys_info(void)
++{
++  int active_porcess, total_process = 0;
++  int mem_size , total_memSize = 0;
++
++  count_process(&active_porcess, &total_process);
++  count_memory(&mem_size, &total_memSize);
++
++  //read the struct address from user space
++  uint64 addr;
++  argaddr(0, &addr);
++
++  struct procInfo kernel_procInfo;
++  copyin(myproc()->pagetable, (char* )&kernel_procInfo, addr, sizeof(struct procInfo));
++  // printf("in kernel space: %d\n", kernel_procInfo.totalProcess);
++  
++  kernel_procInfo.activeProcess = active_porcess;
++  kernel_procInfo.totalProcess = total_process;
++  kernel_procInfo.memSize = mem_size;
++  kernel_procInfo.totalMemSize = total_memSize;
++
++  copyout(myproc()->pagetable, addr, (char* )&kernel_procInfo, sizeof(struct procInfo));
++
++  return 0;
++}
++
++
++//initialize userSpinLock
++uint64
++sys_uinitlock(void)
++{
++  get_lock_init();
++  return 0;
++}
++
++//acquire lock
++uint64
++sys_uacquire(void)
++{
++  get_acquire();
++  return 0;
++}
++
++//release lock
++uint64
++sys_urelease(void)
++{
++  get_release();
++  return 0;
++}
++
++//task 3--set and get syscall for last cmd
++uint64
++sys_getLastCmd(void)
++{
++  get_last_cmd();
++  return 0;
++}
++
++uint64
++sys_setLastCmd(void)
++{
++  set_last_cmd();
++  return 0;
++}
+diff --git a/user/load.c b/user/load.c
+new file mode 100644
+index 0000000..e8be43f
+--- /dev/null
++++ b/user/load.c
+@@ -0,0 +1,68 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int main(int argc, char **argv)
++{
++    int childCount = atoi(argv[1]);
++    int allocationAmount = atoi(argv[2]);
++
++    uinitlock();
++
++    uacquire();
++    printf("Parent is going to sleep.\n");
++    urelease();
++
++    for(int i = 0; i < childCount; i++)
++    {
++        int pid;
++        pid = fork();
++
++        if(pid == 0)
++        {
++            uacquire();
++            printf("\nChild is created.\n");
++            
++            //new created process
++            char* allocated_mem = malloc(allocationAmount);
++            for (int i = 0; i < allocationAmount; i++) {
++                allocated_mem[i] = 1;  // Write to each byte to force memory allocation.
++            }
++        
++            printf("Child allocated %d byte.\n", allocationAmount);
++            
++            printf("Child going to sleep\n");
++            urelease();
++
++            sleep(100);//child is sleeping means simulationg doing some wrok
++
++            exit(0);
++        }
++    }
++
++
++    //code for system information
++    struct procInfo proc_info;
++    struct procInfo* user_procInfo = &proc_info;
++    info(user_procInfo);
++
++    sleep(200);//parent goes to sleep,, allow children to complete their work
++
++     for(int i = 0; i < childCount ; i++)
++    {
++        wait(0);
++    }
++
++    uacquire();
++    printf("Parent wake up.\n");
++    urelease();
++    
++    uacquire();
++    printf("\nCurrent system information:\n");
++    printf("Processes: %d/%d\n", user_procInfo->activeProcess, user_procInfo->totalProcess);
++    printf("RAM: %d/%d", user_procInfo->memSize, user_procInfo->totalMemSize);
++    printf("    (in KB/MB)\n");
++    urelease();
++
++    exit(0);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user/sh.c b/user/sh.c
+index 836ebcb..c1af0cd 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -3,6 +3,7 @@
+ #include "kernel/types.h"
+ #include "user/user.h"
+ #include "kernel/fcntl.h"
++#include <stddef.h>//added for NULL
+ 
+ // Parsed command representation
+ #define EXEC  1
+@@ -76,10 +77,60 @@ runcmd(struct cmd *cmd)
+     ecmd = (struct execcmd*)cmd;
+     if(ecmd->argv[0] == 0)
+       exit(1);
+-    exec(ecmd->argv[0], ecmd->argv);
+-    fprintf(2, "exec %s failed\n", ecmd->argv[0]);
++
++    //counting the arg count
++    int arg_count = 0;
++    while (ecmd->argv[arg_count + 1] != NULL) { // Count args starting from argv[1]
++        arg_count++;
++    }
++
++    if(strcmp(ecmd->argv[0], "!!") == 0)
++    {
++      // printf("Previous command need to run\n");
++      char lastCommand[128];
++      char lastArgv[10][128];
++      getCommand(lastCommand,lastArgv, &arg_count );
++
++      //copying the args into this *pointer array
++      char *args[arg_count+1];
++      for (int i = 0; i < arg_count; i++) {
++          args[i] = lastArgv[i]; // Copy the previous arguments
++      }
++      args[arg_count] = 0; 
++
++      //initialize the ecmd form args
++      printf("%s ", lastCommand);
++      ecmd->argv[0] = lastCommand;
++      for (int i = 0; i < arg_count; i++) { // Start from 1 to align with args[1] and onward
++        ecmd->argv[i+1] = args[i];
++        printf("%s ", args[i]);//for printing the last command
++      }
++      ecmd->argv[arg_count+1] = 0;//set the last arg null
++      printf("\n");//
++
++      //execute the previous command
++      if (exec(ecmd->argv[0], ecmd->argv) < 0) {
++        printf("exec %s failed\n", lastCommand);
++      }
++
++
++    }
++    else
++    {
++      char last_args[10][128];
++
++      for (int i = 0; i < arg_count && i < 10; i++) {
++          memcpy(last_args[i], ecmd->argv[i+1], strlen(ecmd->argv[i+1]) + 1);//changed here 
++      }
++
++      setCommand(ecmd->argv[0], last_args, &arg_count);/////set last command ///////
++
++      exec(ecmd->argv[0], ecmd->argv);//execute the command
++      fprintf(2, "exec %s failed\n", ecmd->argv[0]);
++    }
+     break;
+ 
++
+   case REDIR:
+     rcmd = (struct redircmd*)cmd;
+     close(rcmd->fd);
+diff --git a/user/trace.c b/user/trace.c
+new file mode 100644
+index 0000000..5aed002
+--- /dev/null
++++ b/user/trace.c
+@@ -0,0 +1,23 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++
++int main(int argc, char **argv)
++{
++    //need to check if first input is trace 
++    int pid = fork();
++
++    if(pid == 0)
++    {
++        int n = atoi(argv[1]);
++        trace(n);//calling trace
++        exec(argv[2],&argv[2]);//calling exec
++        exit(1);
++    }
++    else{
++        wait(0);
++        trace(0);
++    }
++    
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 04013ca..1670888 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,21 @@
++#include "kernel/types.h"//extra added
++typedef unsigned int uint;//extra added
++
+ struct stat;
++//proc stat
++struct procInfo{
++    int activeProcess;
++    int totalProcess;
++    int memSize;
++    int totalMemSize;
++};
++
++//new user lock
++struct userSpinLock
++{
++    volatile int locked;
++};
++
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +39,14 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int info(struct procInfo*);
++void uinitlock(void);
++void uacquire(void);
++void urelease(void);
++void getCommand(char*, char last_args[][128], int*);
++void setCommand(char*, char last_args[][128], int*);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..9743c34 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,10 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("info");
++entry("uinitlock");
++entry("uacquire");
++entry("urelease");
++entry("setCommand");
++entry("getCommand");
